@@ -5,13 +5,25 @@ package keyring
 import (
 	"errors"
 	"fmt"
+	"log"
+	"os"
 
 	gokeychain "github.com/keybase/go-keychain"
+	touchid "github.com/lox/go-touchid"
+	"golang.org/x/crypto/ssh/terminal"
+)
+
+const (
+	biometricsAccount = "x"
+	biometricsService = "x"
+	biometricsLabel   = "Passphrase for %s"
 )
 
 type keychain struct {
-	path    string
-	service string
+	path          string
+	service       string
+	passphrase    string
+	authenticated bool
 
 	passwordFunc PromptFunc
 
@@ -252,6 +264,83 @@ func (k *keychain) Keys() ([]string, error) {
 	return accountNames, nil
 }
 
+func (k *keychain) setupBiometrics() error {
+	fmt.Println("\nTo use biometrics for authentication, your keychain password needs to be stored in your login keychain.\n" +
+		"You will be prompted for your password.\n")
+
+	fmt.Printf("Password for %q: ", k.path)
+	passphrase, err := terminal.ReadPassword(int(os.Stdin.Fd()))
+	if err != nil {
+		return err
+	}
+
+	fmt.Println()
+
+	// needs to be locked first in-case it's already unlocked. if so, an incorrect password can be stored
+	log.Printf("Locking keychain %s", k.path)
+	gokeychain.LockAtPath(k.path)
+
+	log.Printf("Unlocking keychain %s", k.path)
+	if err := gokeychain.UnlockAtPath(k.path, string(passphrase)); err != nil {
+		return err
+	}
+
+	k.passphrase = string(passphrase)
+
+	item := gokeychain.NewItem()
+	item.SetSecClass(gokeychain.SecClassGenericPassword)
+	item.SetService(biometricsService)
+	item.SetAccount(biometricsAccount)
+	item.SetLabel(fmt.Sprintf(biometricsLabel, k.path))
+	item.SetData(passphrase)
+	item.SetSynchronizable(gokeychain.SynchronizableNo)
+	item.SetAccessible(gokeychain.AccessibleWhenUnlocked)
+
+	log.Printf("Adding service=%q, account=%q to osx keychain %s", biometricsService, biometricsAccount, k.path)
+	return gokeychain.AddItem(item)
+}
+
+func (k *keychain) openWithBiometrics() (gokeychain.Keychain, error) {
+	if !k.authenticated {
+		log.Printf("Checking touchid")
+		ok, err := touchid.Authenticate("unlock " + k.path)
+		if !ok || err != nil {
+			return gokeychain.Keychain{}, errors.New("Authentication with biometrics failed")
+		}
+
+		k.authenticated = true
+
+		log.Printf("Looking up password stored in login.keychain")
+		query := gokeychain.NewItem()
+		query.SetSecClass(gokeychain.SecClassGenericPassword)
+		query.SetService(biometricsService)
+		query.SetAccount(biometricsAccount)
+		query.SetLabel(fmt.Sprintf(biometricsLabel, k.path))
+		query.SetMatchLimit(gokeychain.MatchLimitOne)
+		query.SetReturnData(true)
+
+		results, err := gokeychain.QueryItem(query)
+		if err != nil {
+			return gokeychain.Keychain{}, err
+		}
+
+		if len(results) != 1 {
+			err := k.setupBiometrics()
+			if err != nil {
+				return gokeychain.Keychain{}, err
+			}
+		} else {
+			log.Printf("Found passphrase in login.keychain, unlocking %s with stored password", k.path)
+			if err = gokeychain.UnlockAtPath(k.path, string(results[0].Data)); err != nil {
+				return gokeychain.Keychain{}, err
+			}
+			k.passphrase = string(results[0].Data)
+		}
+	}
+
+	return gokeychain.NewWithPath(k.path), nil
+}
+
 func (k *keychain) createOrOpen() (gokeychain.Keychain, error) {
 	kc := gokeychain.NewWithPath(k.path)
 
@@ -259,7 +348,9 @@ func (k *keychain) createOrOpen() (gokeychain.Keychain, error) {
 	err := kc.Status()
 	if err == nil {
 		debugf("Keychain status returned nil, keychain exists")
-		return kc, nil
+		log.Printf("Opening %s with biometrics", k.path)
+		return k.openWithBiometrics()
+		//return kc, nil
 	}
 
 	debugf("Keychain status returned error: %v", err)
